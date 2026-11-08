@@ -1,0 +1,79 @@
+# Every push to main that passes the checks publishes Leaflet, signed with
+# minisign, as the newest release. FerroOS's updater can install it from
+# there, and only if the signature checks out against Leaflet's public key
+# (minisign.pub, to be built into the updater).
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Leaflet is Python and a web page: it's checked and tested, then packed
+      # as it is. The bundled PDF.js and pdf-lib must be exactly the files
+      # listed in ui/vendor/SHA256SUMS, and PDF.js's script engine must not be there.
+      - name: Check and test
+        run: |
+          python3 -m py_compile leaflet.py leaflet_formats.py
+          [ -f ui/index.html ] || { echo "ui/index.html is missing" >&2; exit 1; }
+          (cd ui/vendor && sha256sum --strict -c --quiet SHA256SUMS)
+          [ -z "$(find ui/vendor -name 'quickjs*' -o -name 'pdf.sandbox*')" ] ||
+              { echo "PDF.js's scripting engine must not be shipped" >&2; exit 1; }
+          python3 -m unittest discover -s tests -p 'test_*.py'
+          node tests/test_pdfops.mjs
+
+      - name: Pack
+        run: |
+          rm -rf dist && mkdir -p dist/leaflet
+          cp -r leaflet.py leaflet_formats.py ui icons LICENSE README.md install.sh dist/leaflet/
+          find dist/leaflet -name '__pycache__' -prune -exec rm -rf {} +
+          echo "$GITHUB_SHA" >dist/leaflet/commit
+          echo "$GITHUB_SHA" >dist/leaflet-commit
+          # Plain files and folders only, owned by nobody in particular.
+          tar --owner=0 --group=0 --numeric-owner --mode=u=rwX,go=rX -C dist -czf dist/leaflet-linux.tar.gz leaflet
+          (cd dist && sha256sum leaflet-linux.tar.gz >leaflet-linux.tar.gz.sha256)
+
+      # The trusted comment names the commit and its time, so the updater
+      # can tell this build is the one it was told about, and never goes
+      # back to an older one.
+      - name: Sign
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          [ -n "$MINISIGN_SECRET_KEY" ] || { echo "MINISIGN_SECRET_KEY isn't set: no release without a signature" >&2; exit 1; }
+          if grep -q PLACEHOLDER minisign.pub; then
+              echo "minisign.pub is still the placeholder: put Leaflet's real public key there first" >&2
+              exit 1
+          fi
+          sudo apt-get install -y -q minisign >/dev/null
+          key=$(mktemp)
+          trap 'rm -f "$key"' EXIT
+          printf '%s\n' "$MINISIGN_SECRET_KEY" >"$key"
+          when=$(git log -1 --format=%ct "$GITHUB_SHA")
+          minisign -S -s "$key" -m dist/leaflet-linux.tar.gz -t "leaflet $GITHUB_SHA $when"
+          # Signed with the key the updater trusts, not some other one.
+          minisign -V -p minisign.pub -m dist/leaflet-linux.tar.gz
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          short=$(echo "$GITHUB_SHA" | cut -c1-7)
+          gh release create "build-$short" --target "$GITHUB_SHA" --latest \
+            --title "Leaflet $short" \
+            --notes "Leaflet, from $GITHUB_SHA. Signed with minisign: minisign -Vm leaflet-linux.tar.gz -P $(tail -1 minisign.pub)" \
+            dist/leaflet-linux.tar.gz dist/leaflet-linux.tar.gz.sha256 \
+            dist/leaflet-linux.tar.gz.minisig dist/leaflet-commit

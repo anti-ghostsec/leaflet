@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; media-src 'none'; object-src 'none'; frame-src 'none'; child-src 'self'; form-action 'none'; base-uri 'none'">
+<title>Leaflet</title>
+<link rel="stylesheet" href="vendor/pdfjs/pdf_viewer.css">
+<link rel="stylesheet" href="style.css">
+</head>
+<body class="empty">
+<header id="toolbar" role="toolbar" aria-label="Toolbar">
+  <div class="group">
+    <button data-cmd="open" title="Open (Ctrl+O)"></button>
+    <button data-cmd="save" class="save" title="Save (Ctrl+S)"></button>
+    <button data-cmd="menu" title="More: save as, export, print"></button>
+  </div>
+  <div class="group needs-file">
+    <button data-cmd="sidebar" title="Pages / outline (F9)"></button>
+  </div>
+
+  <div class="group pdf-only">
+    <button data-cmd="prev" title="Previous page (Page Up)"></button>
+    <label class="pagebox" title="Go to page (Ctrl+G)"><input id="page" inputmode="numeric" aria-label="Page"><span id="pages">/ 0</span></label>
+    <button data-cmd="next" title="Next page (Page Down)"></button>
+  </div>
+  <div class="group pdf-only">
+    <button data-cmd="zoom-out" title="Zoom out (Ctrl+−)"></button>
+    <select id="zoom" aria-label="Zoom">
+      <option value="page-width">Fit width</option><option value="page-fit">Fit page</option>
+      <option value="0.5">50%</option><option value="0.75">75%</option><option value="1">100%</option>
+      <option value="1.25">125%</option><option value="1.5">150%</option><option value="2">200%</option>
+      <option value="3">300%</option><option value="custom" hidden></option>
+    </select>
+    <button data-cmd="zoom-in" title="Zoom in (Ctrl+=)"></button>
+  </div>
+  <div class="group pdf-only">
+    <button data-cmd="rotate" title="Turn pages right (Ctrl+R)"></button>
+    <button data-cmd="delete-pages" title="Delete pages (Delete in the page list)"></button>
+    <button data-cmd="insert-pdf" title="Insert pages from another PDF"></button>
+    <button data-cmd="undo-pages" title="Undo the last page change"></button>
+  </div>
+  <div class="group pdf-only tools" role="radiogroup" aria-label="Tools">
+    <button data-cmd="tool-select" class="on" title="Select text (Esc)"></button>
+    <button data-cmd="tool-highlight" title="Highlight (H)"></button>
+    <button data-cmd="tool-note" title="Note: add text (N)"></button>
+    <button data-cmd="tool-draw" title="Draw (D)"></button>
+  </div>
+
+  <div class="group doc-only">
+    <select id="block" aria-label="Paragraph style" title="Paragraph style (Ctrl+0…3)">
+      <option value="p">Text</option><option value="h1">Heading 1</option>
+      <option value="h2">Heading 2</option><option value="h3">Heading 3</option>
+    </select>
+  </div>
+  <div class="group doc-only">
+    <button data-cmd="bold" title="Bold (Ctrl+B)"></button>
+    <button data-cmd="italic" title="Italic (Ctrl+I)"></button>
+    <button data-cmd="underline" title="Underline (Ctrl+U)"></button>
+  </div>
+  <div class="group doc-only">
+    <button data-cmd="ul" title="Bulleted list (Ctrl+Shift+8)"></button>
+    <button data-cmd="ol" title="Numbered list (Ctrl+Shift+7)"></button>
+    <button data-cmd="align" title="Alignment (Ctrl+L/E/R/J)"></button>
+  </div>
+  <div class="group doc-only">
+    <button data-cmd="table" title="Table"></button>
+    <button data-cmd="image" title="Insert a picture"></button>
+    <button data-cmd="undo" title="Undo (Ctrl+Z)"></button>
+    <button data-cmd="redo" title="Redo (Ctrl+Shift+Z)"></button>
+  </div>
+
+  <div class="spacer"></div>
+  <div class="group needs-file search">
+    <input id="find" type="search" placeholder="Find" aria-label="Find (Ctrl+F)" autocomplete="off" spellcheck="false">
+    <span id="find-count"></span>
+    <button data-cmd="find-prev" title="Previous match (Shift+F3)"></button>
+    <button data-cmd="find-next" title="Next match (F3)"></button>
+  </div>
+  <div class="group">
+    <button data-cmd="settings" title="Settings"></button>
+  </div>
+</header>
+
+<div id="banner" hidden><span id="banner-text"></span><button data-cmd="banner-close" class="plain">Dismiss</button></div>
+
+<main id="main">
+  <aside id="sidebar" hidden>
+    <div id="thumbs" tabindex="0" role="listbox" aria-label="Pages" aria-multiselectable="true"></div>
+    <nav id="outline" aria-label="Outline"></nav>
+  </aside>
+  <section id="stage">
+    <div id="welcome">
+      <div class="card">
+        <div class="logo" aria-hidden="true"></div>
+        <h1>Leaflet</h1>
+        <p class="lead">PDFs and documents, light and private.</p>
+        <div class="actions">
+          <button data-cmd="open" class="primary">Open a file…</button>
+          <button data-cmd="new">New document</button>
+        </div>
+        <p class="hint">Or drop a file here. Opens PDF, DOCX, ODT, RTF and TXT.</p>
+        <div id="recent" hidden><h2>Recent files</h2><ul></ul></div>
+      </div>
+    </div>
+    <div id="pdf-container" hidden><div id="viewer" class="pdfViewer"></div></div>
+    <div id="doc-scroll" hidden><article id="doc" contenteditable="true" spellcheck="true"></article></div>
+  </section>
+</main>
+
+<footer id="status"><span id="status-left"></span><span id="status-right"></span></footer>
+
+<div id="menu" class="popup" hidden role="menu"></div>
+<div id="tablebar" class="popup" hidden></div>
+<div id="modal" hidden><div class="dialog" role="dialog" aria-modal="true"></div></div>
+
+<script src="app.js" type="module"></script>
+</body>
+</html>
