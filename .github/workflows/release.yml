@@ -18,9 +18,18 @@ concurrency:
 
 jobs:
   linux:
+    # Only main is ever signed and published. A run started by hand from
+    # another branch or a tag is skipped here, and the signing step checks
+    # the ref once more. The key is a secret of the "release" environment,
+    # which the repository settings restrict to the main branch.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    environment: release
     steps:
-      - uses: actions/checkout@v4
+      # Actions are pinned to a commit, not to a tag that can be moved.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       # Leaflet is Python and a web page: it's checked and tested, then packed
       # as it is. The bundled PDF.js and pdf-lib must be exactly the files
@@ -53,6 +62,7 @@ jobs:
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
         run: |
+          [ "$GITHUB_REF" = refs/heads/main ] || { echo "only main is signed, not $GITHUB_REF" >&2; exit 1; }
           [ -n "$MINISIGN_SECRET_KEY" ] || { echo "MINISIGN_SECRET_KEY isn't set: no release without a signature" >&2; exit 1; }
           if grep -q PLACEHOLDER minisign.pub; then
               echo "minisign.pub is still the placeholder: put Leaflet's real public key there first" >&2

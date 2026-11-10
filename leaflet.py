@@ -10,12 +10,20 @@ Nothing in the window can reach the network: the page is served from a
 private leaflet:// scheme, its Content-Security-Policy only allows that
 scheme, and the web view's proxy is a closed port.
 
+The page never names a file. Which file is read or written is decided here:
+by a file dialog, the command line, a file dropped on the window, the open
+document's own path, or the recent list, which the page refers to by number.
+
 Usage: leaflet.py [FILE ...]
 """
+import atexit
 import json
 import os
+import shutil
+import signal
 import sys
 import tempfile
+import time
 import uuid
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
@@ -118,6 +126,58 @@ def read_limited(path):
     return data
 
 
+class TempDirs:
+    """Private folders (0700) for a file on its way to the printer or out of an
+    export. Each is removed as soon as it's done with, and whatever is left
+    goes when Leaflet quits, however it quits."""
+    PREFIX = 'leaflet-tmp-'
+
+    def __init__(self):
+        self.dirs = set()
+        atexit.register(self.clear)
+
+    def make(self):
+        path = tempfile.mkdtemp(prefix=self.PREFIX)
+        self.dirs.add(path)
+        return path
+
+    def remove(self, path):
+        self.dirs.discard(path)
+        shutil.rmtree(path, ignore_errors=True)
+
+    def clear(self):
+        for path in list(self.dirs):
+            self.remove(path)
+
+    def remove_stale(self, age=24 * 3600):
+        """Folders a killed or crashed Leaflet left behind (a day old, so not
+        one that another running Leaflet is using)."""
+        base = tempfile.gettempdir()
+        try:
+            names = os.listdir(base)
+        except OSError:
+            return
+        for name in names:
+            path = os.path.join(base, name)
+            try:
+                st = os.lstat(path)
+            except OSError:
+                continue
+            if (name.startswith(self.PREFIX) and os.path.isdir(path) and not os.path.islink(path)
+                    and st.st_uid == os.getuid() and time.time() - st.st_mtime > age and path not in self.dirs):
+                shutil.rmtree(path, ignore_errors=True)
+
+
+TEMP = TempDirs()
+
+
+def clean_name(name, fallback='Untitled'):
+    """A file name the page suggested, as a plain name: no folders, nothing odd."""
+    name = os.path.basename(str(name or '').replace('\\', '/'))
+    name = ''.join(c for c in name if c.isprintable()).strip().lstrip('.')[:120]
+    return name or fallback
+
+
 class Store:
     """Bytes handed between Python and the page, each fetched once by a token."""
 
@@ -146,6 +206,8 @@ class LeafletWindow(Gtk.ApplicationWindow):
         self.pending = pending      # ('path', p), ('data', bytes, name) or ('new',)
         self.ready = False
         self.after_save = None
+        self.recent_shown = []      # the recent files as last sent to the page; it picks one by number
+        self.exports = {}           # ticket -> where an export in progress goes (chosen in a dialog)
 
         size = app.settings.get('_window', {})
         self.set_default_size(size.get('w', 1100), size.get('h', 800))
@@ -192,6 +254,11 @@ class LeafletWindow(Gtk.ApplicationWindow):
         self.web.connect('permission-request', lambda _v, req: (req.deny(), True)[1])
         self.web.connect('web-process-terminated', self.on_crash)
         self.web.connect('create', lambda *_: None)
+        # Files dragged in from a file manager are taken here, by GTK, so the
+        # page never has to be believed about a path.
+        drop = Gtk.DropTarget.new(Gdk.FileList, Gdk.DragAction.COPY)
+        drop.connect('drop', self.on_drop)
+        self.web.add_controller(drop)
         self.set_child(self.web)
         self.connect('close-request', self.on_close_request)
         self.web.load_uri('leaflet://app/index.html')
@@ -213,16 +280,21 @@ class LeafletWindow(Gtk.ApplicationWindow):
 
     def state(self):
         s = self.app.settings
+        recent = s.get('recent', []) if s.get('remember_recent') else []
+        self.recent_shown = [p for p in recent if isinstance(p, str) and os.path.exists(p)]
+        # The page gets names to show; the paths stay here.
         return {'theme': self.theme(), 'themeSetting': os.environ.get('LEAFLET_THEME') or s.get('theme', 'auto'),
                 'rememberRecent': bool(s.get('remember_recent')),
-                'recent': [p for p in s.get('recent', []) if os.path.exists(p)] if s.get('remember_recent') else []}
+                'recent': [{'name': os.path.basename(p), 'folder': os.path.dirname(p)} for p in self.recent_shown]}
 
     def on_message(self, _manager, value):
         try:
             msg = json.loads(value.to_string())
         except (ValueError, TypeError):
             return
-        cmd = msg.get('cmd')
+        if not isinstance(msg, dict) or not isinstance(msg.get('cmd'), str):
+            return
+        cmd = msg['cmd']
         handler = getattr(self, f'cmd_{cmd}'.replace('-', '_'), None)
         if handler:
             try:
@@ -252,8 +324,10 @@ class LeafletWindow(Gtk.ApplicationWindow):
         self.set_title(f'{"• " if self.dirty else ""}{name} — Leaflet')
 
     def cmd_open(self, msg):
-        if msg.get('path'):         # from the recent list
-            self.open_path(msg['path'])
+        if 'recent' in msg:         # a file in the recent list, by its place in it
+            n = msg['recent']
+            if isinstance(n, int) and not isinstance(n, bool) and 0 <= n < len(self.recent_shown):
+                self.app.open_in(self, self.recent_shown[n])
             return
         dialog = Gtk.FileDialog(title='Open', modal=True)
         filters = Gio.ListStore.new(Gtk.FileFilter)
@@ -287,15 +361,18 @@ class LeafletWindow(Gtk.ApplicationWindow):
         self.cmd_title({'dirty': False})
 
     def cmd_drop(self, msg):
-        uri = msg.get('uri') or ''
-        if uri.startswith('file://'):
-            path = Gio.File.new_for_uri(uri).get_path()
-            if path:
-                self.app.open_in(self, path)
-                return
+        """A dropped file that reached the page: it sends the contents, never a
+        path. (Files dropped from a file manager are taken by on_drop below.)"""
         data, _ = self.store.take(msg.get('token', ''))
         if data is not None:
-            self.app.open_in(self, None, data=data, name=msg.get('name') or 'Dropped file')
+            self.app.open_in(self, None, data=data, name=clean_name(msg.get('name'), 'Dropped file'))
+
+    def on_drop(self, _target, value, _x, _y):
+        """Files dropped on the window, straight from GTK: the page isn't asked."""
+        paths = [f.get_path() for f in value.get_files() if f.get_path()]
+        for path in paths[:8]:
+            self.app.open_in(self, path)
+        return bool(paths)
 
     def cmd_pick(self, msg):
         """A file to put into the current one: a PDF to merge, or a picture."""
@@ -343,6 +420,11 @@ class LeafletWindow(Gtk.ApplicationWindow):
         if data is None:
             self.error('Nothing to save.')
             return
+        # A document is saved as a document, and only a PDF as a PDF.
+        if fmt not in SAVE_FILTERS or (fmt == 'pdf') != (kind != 'text/html') or \
+                (fmt == 'pdf' and formats.detect(data) != 'pdf'):
+            self.error('Leaflet can\'t save that.')
+            return
         try:
             if kind == 'text/html':
                 doc = formats.from_html(data.decode('utf-8'))
@@ -356,6 +438,9 @@ class LeafletWindow(Gtk.ApplicationWindow):
             return
         self.ask_where(fmt, msg.get('suggest'), lambda path: self.write(path, data, fmt, msg))
 
+    # Where a file goes is only ever chosen here, in a dialog; the page can
+    # suggest a name for it and nothing more.
+
     def ask_where(self, fmt, suggest, then):
         dialog = Gtk.FileDialog(title='Save as' if fmt != 'pdf' or self.kind == 'pdf' else 'Export as PDF',
                                 modal=True)
@@ -366,8 +451,8 @@ class LeafletWindow(Gtk.ApplicationWindow):
         filters = Gio.ListStore.new(Gtk.FileFilter)
         filters.append(flt)
         dialog.set_filters(filters)
-        base = suggest or (os.path.splitext(self.name)[0] if self.name else 'Untitled')
-        dialog.set_initial_name(f'{os.path.splitext(base)[0]}.{fmt}')
+        base = clean_name(suggest or self.name)
+        dialog.set_initial_name(f'{os.path.splitext(base)[0] or "Untitled"}.{fmt}')
         if self.path:
             dialog.set_initial_folder(Gio.File.new_for_path(os.path.dirname(self.path)))
 
@@ -376,8 +461,10 @@ class LeafletWindow(Gtk.ApplicationWindow):
                 f = d.save_finish(res)
             except GLib.Error:
                 return
-            path = f.get_path()
-            if path and not path.lower().endswith('.' + fmt):
+            path = f.get_path() if f else None
+            if not path:
+                return
+            if not path.lower().endswith('.' + fmt):
                 path += '.' + fmt
             then(path)
         dialog.save(self, None, done)
@@ -399,10 +486,13 @@ class LeafletWindow(Gtk.ApplicationWindow):
             then, self.after_save = self.after_save, None
             then()
 
-    def cmd_export_pdf(self, msg):
+    def cmd_export_pdf(self, _msg):
         """Print the document to a PDF; the page then strips its metadata and saves it."""
-        def go(target):
-            tmpdir = tempfile.mkdtemp(prefix='leaflet-')
+        self.ask_where('pdf', None, self.export_pdf_to)
+
+    def export_pdf_to(self, target):
+        tmpdir = TEMP.make()
+        try:
             out = os.path.join(tmpdir, 'export.pdf')
             settings = Gtk.PrintSettings()
             settings.set_printer('Print to File')
@@ -416,53 +506,45 @@ class LeafletWindow(Gtk.ApplicationWindow):
             op.set_print_settings(settings)
             op.set_page_setup(setup)
 
-            def cleanup():
-                try:
-                    os.unlink(out)
-                except OSError:
-                    pass
-                try:
-                    os.rmdir(tmpdir)
-                except OSError:
-                    pass
-
             def finished(_op):
                 try:
                     data = read_limited(out)
-                except OSError as e:
-                    self.error(f'Couldn\'t export: {e}')
-                    cleanup()
+                except (OSError, formats.FormatError) as e:
+                    self.error(f'Couldn\'t export: {getattr(e, "strerror", None) or e}')
                     return
-                cleanup()
-                token = self.store.put(data)
-                self.send('exported', token=token, path=target)
+                finally:
+                    TEMP.remove(tmpdir)
+                # The page gets the printed file and a ticket; the ticket, not
+                # the page, says where the cleaned file is written.
+                ticket = uuid.uuid4().hex
+                self.exports[ticket] = target
+                self.send('exported', token=self.store.put(data), ticket=ticket)
 
             def failed(_op, err):
-                cleanup()
+                TEMP.remove(tmpdir)
                 self.error(f'Couldn\'t export: {err.message}')
             op.connect('finished', finished)
             op.connect('failed', failed)
             op.print_()
-        if msg.get('path'):         # tests give the file name directly
-            go(msg['path'])
-        else:
-            self.ask_where('pdf', None, go)
+        except BaseException:
+            TEMP.remove(tmpdir)
+            raise
 
     def cmd_write_export(self, msg):
+        target = self.exports.pop(msg.get('ticket'), None) if isinstance(msg.get('ticket'), str) else None
         data, _ = self.store.take(msg.get('token', ''))
-        if data is not None:
-            self.write(msg['path'], data, 'pdf', {'export': True})
+        if target is None or data is None or formats.detect(data) != 'pdf':
+            return
+        self.write(target, data, 'pdf', {'export': True})
 
     def cmd_print(self, msg):
         data, _ = self.store.take(msg.get('token', ''))
         if data is None:        # a document: print the page as it's laid out
             WebKit.PrintOperation.new(self.web).run_dialog(self)
             return
-        # A PDF: hand the file itself to the print dialog, from a private folder.
-        tmpdir = tempfile.mkdtemp(prefix='leaflet-print-')
-        path = os.path.join(tmpdir, os.path.splitext(self.name or 'document')[0] + '.pdf')
-        with open(path, 'wb') as f:
-            f.write(data)
+        # A PDF: hand the file itself to the print dialog, from a private folder
+        # that goes away again whatever happens to the print job.
+        tmpdir = TEMP.make()
 
         def done(dialog, res):
             try:
@@ -471,12 +553,15 @@ class LeafletWindow(Gtk.ApplicationWindow):
                 if not e.matches(Gtk.dialog_error_quark(), Gtk.DialogError.DISMISSED):
                     self.error(f'Couldn\'t print: {e.message}')
             finally:
-                for p in (path, tmpdir):
-                    try:
-                        os.unlink(p) if p == path else os.rmdir(p)
-                    except OSError:
-                        pass
-        Gtk.PrintDialog(modal=True).print_file(self, None, Gio.File.new_for_path(path), None, done)
+                TEMP.remove(tmpdir)
+        try:
+            path = os.path.join(tmpdir, os.path.splitext(clean_name(self.name, 'document'))[0] + '.pdf')
+            with open(path, 'wb') as f:
+                f.write(data)
+            Gtk.PrintDialog(modal=True).print_file(self, None, Gio.File.new_for_path(path), None, done)
+        except BaseException:
+            TEMP.remove(tmpdir)
+            raise
 
     def cmd_link(self, msg):
         url = msg.get('url') or ''
@@ -629,6 +714,7 @@ class LeafletWindow(Gtk.ApplicationWindow):
         return menu.get_n_items() == 0
 
     def on_crash(self, _view, _reason):
+        self.exports.clear()
         self.web.load_uri('leaflet://app/index.html')
         if self.path:
             self.pending = ('path', self.path)
@@ -640,6 +726,7 @@ class LeafletWindow(Gtk.ApplicationWindow):
             self.ask_unsaved(lambda: (setattr(self, 'closing', True), self.close()))
             return True
         self.app.store_window(self)
+        self.exports.clear()
         return False
 
     def ask_unsaved(self, then):
@@ -681,6 +768,15 @@ class LeafletApp(Gtk.Application):
         sec = self.web_context.get_security_manager()
         sec.register_uri_scheme_as_secure('leaflet')
         sec.register_uri_scheme_as_cors_enabled('leaflet')
+        # Asked to stop: quit the ordinary way, so nothing is left in the temporary folder.
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, lambda: self.quit() or GLib.SOURCE_REMOVE)
+        if not os.environ.get('LEAFLET_TEST'):
+            TEMP.remove_stale()
+
+    def do_shutdown(self):
+        TEMP.clear()
+        Gtk.Application.do_shutdown(self)
         # Keyboard shortcuts are handled by the page (ui/app.js).
 
     def ask_quit(self):

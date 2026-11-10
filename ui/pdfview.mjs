@@ -105,6 +105,7 @@ export class PdfMode {
     this.name = msg.name;
     const bytes = await this.app.take(msg.token);
     this.undo = [];
+    this.toldMetadata = this.keptMetadata = false;
     await this.load(bytes);
     this.app.setDirty(false);
   }
@@ -161,7 +162,7 @@ export class PdfMode {
     this.updateButtons();
     this.app.status(`PDF · ${doc.numPages} page${doc.numPages === 1 ? '' : 's'}${this.encrypted ? ' · encrypted' : ''}`, null);
     if (info.IsXFAPresent) this.app.banner('This PDF has an XFA form, which Leaflet shows but can\'t fill in.');
-    else if (this.encrypted) this.app.banner('This PDF is encrypted. You can read, fill in and annotate it; turning, deleting or adding pages needs an unencrypted copy.');
+    else if (this.encrypted) this.app.banner('This PDF is encrypted. You can read, fill in and annotate it; turning, deleting or adding pages needs an unencrypted copy, and so does removing its author, dates and other metadata when it\'s saved.');
   }
 
   async close() {
@@ -183,7 +184,32 @@ export class PdfMode {
     this.app.busy(true);
     try {
       let bytes = await this.currentBytes();
-      if (!this.encrypted) bytes = await (await this.app.pdfops()).finalize(bytes);
+      // An encrypted PDF can't be rewritten here, so nothing can be taken
+      // out of it: it's saved as it is, and the user is told so first.
+      this.keptMetadata = this.encrypted;
+      if (!this.keptMetadata) {
+        const ops = await this.app.pdfops();
+        try {
+          bytes = await ops.finalize(bytes);
+        } catch (e) {
+          if (!(e instanceof ops.EncryptedError)) throw e;
+          this.keptMetadata = true;
+        }
+      }
+      if (this.keptMetadata && !this.toldMetadata) {
+        this.app.busy(false);
+        const ok = await this.app.dialog({
+          title: 'This PDF keeps its metadata',
+          text: `${this.name} is encrypted, so Leaflet can't clean it the way it cleans other PDFs when it saves them. `
+            + 'The author, program names and dates in the file, the names on its notes and whatever its pictures carry '
+            + 'all stay as they are, and notes you add are saved with the time you made them.\n\n'
+            + 'For a clean file, make an unencrypted copy with the program that protected it, and open that.',
+          buttons: [{ label: 'Cancel', value: false }, { label: 'Save anyway', value: true, primary: true }],
+        });
+        if (!ok) return;
+        this.toldMetadata = true;       // once for each file that's opened
+        this.app.busy(true);
+      }
       const token = await this.app.put(bytes, 'application/pdf');
       this.app.post('save', { token, as: !!as, format: 'pdf', suggest: this.name });
     } finally {
@@ -206,6 +232,7 @@ export class PdfMode {
   saved(m) {
     this.name = m.name;
     this.doc?.annotationStorage.resetModified();
+    if (this.keptMetadata) this.app.status(`Saved ${m.name} (encrypted: its metadata was kept)`, null);
   }
 
   // ---------------------------------------------------------------- page operations

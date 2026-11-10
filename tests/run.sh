@@ -1,6 +1,7 @@
 #!/bin/sh
 # All of Leaflet's tests.   tests/run.sh [--live]
-#   - document formats (Python, no extra packages)
+#   - document formats, the release workflow, and what leaflet.py accepts
+#     from the page (Python, no extra packages; the last needs GTK and WebKitGTK)
 #   - PDF page operations (needs node)
 #   - with --live: the real window on a virtual screen (needs Xvfb, or a DISPLAY)
 set -eu

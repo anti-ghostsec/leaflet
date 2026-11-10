@@ -230,6 +230,32 @@ class HostileFilesTest(unittest.TestCase):
         with self.assertRaises(lf.FormatError):
             lf.read_docx(data)
 
+    def test_doctype_refused_in_any_encoding(self):
+        # UTF-16 hides "<!DOCTYPE" from a search through the bytes.
+        xml = ('<?xml version="1.0"?><!DOCTYPE l [<!ENTITY a "expanded-entity">]>'
+               '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>'
+               '<w:p><w:r><w:t>&a;</w:t></w:r></w:p></w:body></w:document>')
+        for codec, bom in (('utf-16-le', b'\xff\xfe'), ('utf-16-be', b'\xfe\xff'), ('utf-16-le', b''),
+                           ('utf-16-be', b''), ('utf-32-le', b'\xff\xfe\0\0'), ('utf-32-be', b'\0\0\xfe\xff'),
+                           ('utf-8', b'\xef\xbb\xbf'), ('latin-1', b'')):
+            with self.subTest(codec=codec, bom=bool(bom)):
+                body = bom + xml.encode(codec)
+                with self.assertRaises(lf.FormatError):
+                    lf.parse_xml(body)
+                with self.assertRaises(lf.FormatError):
+                    lf.read_docx(lf.make_zip([('word/document.xml', body)]))
+        declared = xml.replace('?>', ' encoding="UTF-16"?>', 1)
+        with self.assertRaises(lf.FormatError):
+            lf.parse_xml(b'\xff\xfe' + declared.encode('utf-16-le'))
+
+    def test_utf16_xml_without_doctype_is_read(self):
+        xml = ('<?xml version="1.0" encoding="UTF-16"?>'
+               '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>'
+               '<w:p><w:r><w:t>caf\u00e9 &amp; t\u00e9</w:t></w:r></w:p></w:body></w:document>')
+        for codec, bom in (('utf-16-le', b'\xff\xfe'), ('utf-16-be', b'\xfe\xff')):
+            doc = lf.read_docx(lf.make_zip([('word/document.xml', bom + xml.encode(codec))]))
+            self.assertEqual(text_of(doc.blocks[0]), 'caf\u00e9 & t\u00e9')
+
     def test_zip_bomb_refused(self):
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z:
@@ -256,6 +282,94 @@ class HostileFilesTest(unittest.TestCase):
                     lf.load(data, kind)
             except lf.FormatError:
                 pass
+
+
+def members(data):
+    """Every file inside a saved document, unpacked."""
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        return {name: z.read(name) for name in z.namelist()}
+
+
+class PictureMetadataTest(unittest.TestCase):
+    """Pictures go into saved documents without EXIF (GPS, camera), XMP, IPTC, comments, text or dates."""
+
+    PHOTOS = (('image/jpeg', fixtures.photo_jpeg, fixtures.plain_jpeg), ('image/png', fixtures.photo_png, fixtures.plain_png),
+              ('image/gif', fixtures.photo_gif, fixtures.plain_gif))
+
+    def test_fixtures_carry_metadata(self):
+        for _mime, photo, _plain in self.PHOTOS:
+            self.assertTrue(any(mark in photo() for mark in fixtures.PHOTO_MARKS))
+
+    def test_only_metadata_is_removed(self):
+        # The result is the same file, byte for byte, as one made without the
+        # metadata: the picture data isn't re-encoded, the colour profile, JFIF
+        # and Adobe markers and the PNG colour chunks stay.
+        for mime, photo, plain in self.PHOTOS:
+            with self.subTest(mime=mime):
+                out = lf.strip_image_metadata(photo(), mime)
+                self.assertEqual(out, plain())
+                for mark in fixtures.PHOTO_MARKS:
+                    self.assertNotIn(mark, out)
+                self.assertEqual(lf.strip_image_metadata(out, mime), out)
+                self.assertEqual(lf.image_size(out), lf.image_size(photo()))
+        self.assertIn(b'ICC_PROFILE\x00\x01\x01sample colour profile', fixtures.plain_jpeg())
+
+    def test_orientation_is_the_one_exif_field_kept(self):
+        def orientation(data):
+            at = data.find(b'Exif\x00\x00')
+            if at >= 0:
+                return lf._exif_orientation(data[at + 6:])
+            at = data.find(b'eXIf')
+            return lf._exif_orientation(data[at + 4:]) if at >= 0 else 1
+        for n in range(1, 9):
+            for photo, plain in ((fixtures.photo_jpeg, fixtures.plain_jpeg), (fixtures.photo_png, fixtures.plain_png)):
+                out = lf.strip_image_metadata(photo(n))
+                self.assertEqual(orientation(photo(n)), n)
+                self.assertEqual(orientation(out), n)
+                self.assertEqual(out, plain(n))
+                self.assertEqual(b'Exif' in out or b'eXIf' in out, n != 1)       # upright needs no EXIF at all
+        big_endian = fixtures.png(24, 12, (30, 120, 60), fixtures.PNG_COLOUR, fixtures.png_chunk(b'eXIf', fixtures.exif(8, '>')))
+        self.assertEqual(lf.strip_image_metadata(big_endian), fixtures.plain_png(8))
+
+    def test_damaged_pictures(self):
+        photo = fixtures.photo_jpeg()
+        cut = photo[:photo.rindex(b'\xff\xd9') - 1]              # ends in the middle of the picture data
+        out = lf.strip_image_metadata(cut)
+        self.assertEqual(out, fixtures.plain_jpeg()[:-3])
+        for junk in (b'', b'\xff\xd8', b'\xff\xd8\xff\xe1\xff\xff', photo[:40], fixtures.photo_png()[:60],
+                     fixtures.photo_gif()[:20], b'\x89PNG\r\n\x1a\n' + b'\xff' * 30, b'BM' + b'\0' * 40):
+            self.assertEqual(lf.strip_image_metadata(junk), junk)     # left as it was, and no error
+
+    def document(self):
+        return lf.Document([Para([Text('Three pictures: ')] + [Image(photo(), mime, 16, 8, 'a picture')
+                                                               for mime, photo, _plain in self.PHOTOS])])
+
+    def check_saved(self, data, read):
+        for name, body in members(data).items():
+            for mark in fixtures.PHOTO_MARKS:
+                self.assertNotIn(mark, body, f'{mark!r} in {name}')
+        images = [r for r in read(data).blocks[0].runs if isinstance(r, Image)]
+        self.assertEqual([im.data for im in images], [plain() for _mime, _photo, plain in self.PHOTOS])
+
+    def test_saved_docx_and_odt(self):
+        self.check_saved(lf.write_docx(self.document()), lf.read_docx)
+        self.check_saved(lf.write_odt(self.document()), lf.read_odt)
+
+    def test_saved_from_the_editor(self):
+        # the way a picture comes back from the page: as a data: URL in its HTML
+        doc = lf.from_html(lf.to_html(self.document()))
+        self.assertTrue(any(mark in r.data for r in doc.blocks[0].runs if isinstance(r, Image)
+                            for mark in fixtures.PHOTO_MARKS))
+        self.check_saved(lf.save(doc, 'docx'), lf.read_docx)
+        self.check_saved(lf.save(doc, 'odt'), lf.read_odt)
+
+    def test_opened_and_saved_again(self):
+        with_photo = lf.make_zip([(name, fixtures.photo_png() if name == 'word/media/image1.png' else body)
+                                  for name, body in members(fixtures.sample_docx()).items()])
+        self.assertIn(b'Sample Author', members(with_photo)['word/media/image1.png'])
+        saved = lf.write_docx(lf.read_docx(with_photo))
+        media = [body for name, body in members(saved).items() if name.startswith('word/media/')]
+        self.assertEqual(media, [fixtures.plain_png()])
 
 
 if __name__ == '__main__':

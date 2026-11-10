@@ -6,7 +6,9 @@
 Uses only the test files from fixtures.py. Every request the web view could
 make goes to a local listener (as the "proxy", and as the address the
 hostile PDF points at), which counts them: the check fails if there's any.
-Screenshots of the window are written to OUTDIR/shots.
+The file dialogs are answered from a list here, so "Save as" and "Export"
+run the same code as in the real app. Screenshots of the window are written
+to OUTDIR/shots.
 """
 import http.server
 import json
@@ -14,9 +16,11 @@ import os
 import resource
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
+import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, '..'))
@@ -26,6 +30,11 @@ OUT = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else 'live-out')
 SHOTS = os.path.join(OUT, 'shots')
 FILES = os.path.join(OUT, 'files')
 os.makedirs(SHOTS, exist_ok=True)
+# Leaflet's temporary folders go here, where the check can see what's left of them.
+TMP = os.path.join(OUT, 'tmp')
+os.makedirs(TMP, exist_ok=True)
+os.environ['TMPDIR'] = TMP
+tempfile.tempdir = None
 
 HITS = []
 
@@ -54,11 +63,29 @@ fixtures.write_all(FILES, PORT)
 
 import leaflet  # noqa: E402
 import leaflet_formats as lf  # noqa: E402
-from gi.repository import GLib, WebKit  # noqa: E402
+from gi.repository import Gio, GLib, Gtk, WebKit  # noqa: E402
 
 RESULTS = []
 LINKS = []
-WRITES = []
+ANSWERS = []        # paths the next file dialogs "choose"; with none left, a dialog is cancelled
+ASKED = []          # every file dialog that was opened: (kind, suggested name)
+
+
+def fake_dialog(kind):
+    def show(dialog, _parent, _cancellable, callback):
+        ASKED.append((kind, dialog.get_initial_name()))
+        GLib.idle_add(lambda: callback(dialog, None) and False)
+
+    def finish(_dialog, _result):
+        if not ANSWERS:
+            raise GLib.Error('dismissed')
+        return Gio.File.new_for_path(ANSWERS.pop(0))
+    return show, finish
+
+
+def post(win, msg):
+    """What the page would send to leaflet.py."""
+    return ('js', win, f'window.webkit.messageHandlers.leaflet.postMessage(JSON.stringify({json.dumps(msg)})); return true')
 
 
 def check(name, ok, detail=''):
@@ -135,6 +162,22 @@ def pdf_texts(win):
         return out;''')
 
 
+def unpacked(pdf):
+    """A PDF as it is, and each compressed stream in it unpacked."""
+    yield pdf
+    at = 0
+    while True:
+        at = pdf.find(b'stream', at)
+        if at < 0:
+            return
+        at += 6
+        start = at + (2 if pdf[at:at + 2] == b'\r\n' else 1)
+        try:
+            yield zlib.decompressobj().decompress(pdf[start:pdf.find(b'endstream', start)])
+        except zlib.error:
+            pass
+
+
 def pss_kb(pid):
     try:
         with open(f'/proc/{pid}/smaps_rollup') as f:
@@ -161,16 +204,14 @@ def memory_mb():
 
 
 def scenario(app):
-    win = app.new_window()
-    win.set_default_size(1200, 820)
-    yield ('until', win, 'return !!window.Leaflet && document.readyState === "complete"')
-    yield ('sleep', 0.5)
-    yield ('shot', win, '01-welcome.png')
-
     # ---------------------------------------------------------------- a PDF
-    win.open_path(os.path.join(FILES, 'pages.pdf'))
+    first = [w for w in app.get_windows() if isinstance(w, leaflet.LeafletWindow)]
+    check('a file named on the command line gets a window', len(first) == 1 and os.path.join(FILES, 'pages.pdf') in
+          (first[0].path, (first[0].pending or (0, 0))[1]), first)
+    win = first[0]
+    win.set_default_size(1200, 820)
     r = yield ('until', win, 'return Leaflet.mode && Leaflet.mode.doc && document.querySelectorAll(".thumb canvas").length >= 3 && document.querySelector(".textLayer span") ? Leaflet.mode.doc.numPages : 0')
-    check('PDF opens with page thumbnails and a text layer', r == 5, r)
+    check('PDF opens with page thumbnails and a text layer', r == 5 and win.path == os.path.join(FILES, 'pages.pdf'), r)
     texts = yield pdf_texts(win)
     check('PDF text can be read (for search and copy)', texts and texts[0] == 'Page 1', texts)
     yield ('shot', win, '02-pdf.png')
@@ -204,16 +245,64 @@ def scenario(app):
     yield ('sleep', 0.4)
     yield ('shot', win, '03-pdf-pages-edited.png')
 
+    # "Save as": the name comes from the dialog, with the extension added
     saved = os.path.join(OUT, 'pages-edited.pdf')
-    win.path = saved
-    yield ('js', win, 'await Leaflet.mode.save(false); return true')
+    original = open(os.path.join(FILES, 'pages.pdf'), 'rb').read()
+    ANSWERS.append(saved[:-4])
+    yield ('js', win, 'await Leaflet.mode.save(true); return true')
     r = yield ('until', win, 'return !document.querySelector("#toolbar .save").classList.contains("dirty")')
     data = open(saved, 'rb').read() if os.path.exists(saved) else b''
-    check('save a changed PDF', data.startswith(b'%PDF'), len(data))
+    check('save a changed PDF under a new name', data.startswith(b'%PDF') and win.path == saved and
+          ASKED == [('save', 'pages.pdf')] and open(os.path.join(FILES, 'pages.pdf'), 'rb').read() == original,
+          (len(data), win.path, ASKED))
+    del ASKED[:]
+    # plain "Save" then goes to that file, without asking
+    yield ('js', win, 'const m = Leaflet.mode; m.select([0], true); await m.rotate(90); await m.save(false); return true')
+    r = yield ('until', win, 'return !document.querySelector("#toolbar .save").classList.contains("dirty")')
+    again = open(saved, 'rb').read()
+    check('save again to the same file', again.startswith(b'%PDF') and again != data and not ASKED and
+          win.get_title() == 'pages-edited.pdf — Leaflet', (len(again), ASKED, win.get_title()))
+    data = again
     check('saved PDF has no author/creator/producer or XMP',
           data and not any(x in data for x in (b'Sample Author', b'Sample Writer', b'Sample Producer', b'/Producer',
                                                 b'/Author', b'/Creator', b'pdf-lib', b'xmpmeta')))
     check('deleted page is gone from the saved file', data and b'(Page 4) Tj' not in data)
+
+    # ---------------------------------------------------------------- the start screen and the recent list
+    app.settings.update(remember_recent=True, recent=[os.path.join(FILES, 'extra.pdf'), os.path.join(FILES, 'form.pdf'),
+                                                      os.path.join(FILES, 'gone.pdf')])
+    windows = len(app.get_windows())
+    win0 = app.new_window()
+    win0.set_default_size(1200, 820)
+    yield ('until', win0, 'return !!window.Leaflet && document.readyState === "complete" && document.querySelectorAll("#recent li").length')
+    yield ('sleep', 0.5)
+    yield ('shot', win0, '01-welcome.png')
+    r = yield ('js', win0, 'return [...document.querySelectorAll("#recent li button")].map(b => b.firstChild.textContent)')
+    check('the recent list shows the files that still exist', r == ['extra.pdf', 'form.pdf'], r)
+    # What the page says about paths counts for nothing.
+    secret = os.path.join(FILES, 'sample.txt')
+    planted = os.path.join(OUT, 'planted.pdf')
+    yield ('js', win0, 'window.__t = await LeafletApp.put(new TextEncoder().encode("%PDF-1.4 planted"), "application/pdf"); return true')
+    for msg in ({'cmd': 'open', 'path': secret}, {'cmd': 'open', 'recent': secret}, {'cmd': 'open', 'recent': 7},
+                {'cmd': 'drop', 'uri': 'file://' + secret}, {'cmd': 'export-pdf', 'path': planted}):
+        yield post(win0, msg)
+    yield ('js', win0, f'window.webkit.messageHandlers.leaflet.postMessage(JSON.stringify({{cmd: "write-export", path: {json.dumps(planted)}, ticket: {json.dumps(planted)}, token: window.__t}})); return true')
+    yield ('sleep', 1.5)
+    check('a path sent by the page opens nothing', win0.kind is None and win0.path is None and
+          len(app.get_windows()) == windows + 1, (win0.kind, win0.path, len(app.get_windows())))
+    check('a path sent by the page is not written to', not os.path.exists(planted) and not win0.exports)
+    check('the page asking to open or export only brings up a file dialog',
+          [a[0] for a in ASKED] == ['open', 'save'], ASKED)
+    del ASKED[:]
+    yield ('js', win0, 'document.querySelectorAll("#recent li button")[1].click(); return true')
+    r = yield ('until', win0, 'return document.querySelector(".annotationLayer input[type=text]") ? true : false')
+    check('a recent file opens when it\'s clicked', r is True and win0.path == os.path.join(FILES, 'form.pdf'),
+          (r, win0.path))
+    app.settings.pop('recent')
+    app.settings['remember_recent'] = False
+    win0.dirty = False
+    win0.closing = True
+    win0.close()
 
     # ---------------------------------------------------------------- a form, with annotations
     win2 = app.new_window()
@@ -325,14 +414,34 @@ def scenario(app):
     except Exception as e:  # noqa: BLE001
         check('edited DOCX saves and reads back', False, e)
 
+    # "Save as" in the other format, then export, both through the file dialog
+    as_odt = os.path.join(OUT, 'sample-as.odt')
+    ANSWERS.append(as_odt)
+    yield ('js', win3, 'await Leaflet.mode.save(true, "odt"); return true')
+    deadline = time.time() + 10
+    while not os.path.exists(as_odt) and time.time() < deadline:
+        yield ('sleep', 0.3)
+    try:
+        doc = lf.read_odt(open(as_odt, 'rb').read())
+        check('save a DOCX as ODT', doc.blocks[0].runs[0].text == 'Quarterly notes' and win3.path == as_odt and
+              ASKED == [('save', 'sample-edited.odt')], (win3.path, ASKED))
+    except Exception as e:  # noqa: BLE001
+        check('save a DOCX as ODT', False, e)
+    del ASKED[:]
+
     exported = os.path.join(OUT, 'sample-export.pdf')
-    yield ('js', win3, f'Leaflet.LeafletTest = true; window.webkit.messageHandlers.leaflet.postMessage(JSON.stringify({{cmd: "export-pdf", path: {json.dumps(exported)}}})); return true')
+    ANSWERS.append(exported)
+    yield ('js', win3, 'await Leaflet.mode.command("export-pdf"); return true')
     deadline = time.time() + 30
     while not os.path.exists(exported) and time.time() < deadline:
         yield ('sleep', 0.5)
     yield ('sleep', 0.5)
     data = open(exported, 'rb').read() if os.path.exists(exported) else b''
-    check('export a document as PDF', data.startswith(b'%PDF'), len(data))
+    check('export a document as PDF', data.startswith(b'%PDF') and win3.path == as_odt and
+          ASKED == [('save', 'sample-as.pdf')], (len(data), win3.path, ASKED))
+    del ASKED[:]
+    check('nothing is left in the temporary folder after an export', not os.listdir(TMP) and not leaflet.TEMP.dirs,
+          os.listdir(TMP))
     check('exported PDF has no creator/producer/dates', data and not any(
         x in data for x in (b'cairo', b'/Producer', b'/Creator', b'/CreationDate', b'WebKit')))
 
@@ -357,6 +466,88 @@ def scenario(app):
     yield ('until', win3, 'return Leaflet.mode.doc && document.querySelectorAll(".thumb canvas").length >= 1')
     yield ('sleep', 0.5)
     yield ('shot', win3, '08-exported-pdf.png')
+
+    # ---------------------------------------------------------------- what stays out of saved files
+    win5 = app.new_window()
+    win5.set_default_size(1200, 820)
+    yield ('until', win5, 'return !!window.Leaflet')
+    win5.open_path(os.path.join(FILES, 'refs-all.pdf'))
+    r = yield ('until', win5, 'return Leaflet.mode && Leaflet.mode.doc ? Leaflet.mode.doc.numPages : 0')
+    r = yield ('js', win5, 'const m = Leaflet.mode; await m.pageOp("Deleted page 2", (o, b) => o.remove(b, [1])); return m.doc.numPages')
+    cut = os.path.join(OUT, 'refs-deleted.pdf')
+    ANSWERS.append(cut)
+    yield ('js', win5, 'await Leaflet.mode.save(true); return true')
+    yield ('until', win5, 'return !document.querySelector("#toolbar .save").classList.contains("dirty")')
+    data = open(cut, 'rb').read() if os.path.exists(cut) else b''
+    check('a deleted page that bookmarks, links, tags and fields pointed at is gone from the saved file',
+          r == 2 and data.startswith(b'%PDF') and not any(b'ZQXJ' in part for part in unpacked(data)), (r, len(data)))
+    yield ('js', win5, 'window.__old = Leaflet.mode.doc; return true')
+    win5.kind = None
+    win5.open_path(cut)
+    r = yield ('until', win5, '''
+        const d = Leaflet.mode.doc; if (!d || d === window.__old) return null;
+        const texts = [];
+        for (let i = 1; i <= d.numPages; i++) texts.push((await (await d.getPage(i)).getTextContent()).items.map(x => x.str).join(''));
+        const fields = await d.getFieldObjects();
+        return {texts, outline: (await d.getOutline()).map(o => o.title),
+                fields: (fields instanceof Map ? [...fields.keys()] : Object.keys(fields || {})).sort(),
+                links: (await (await d.getPage(1)).getAnnotations()).filter(a => a.subtype === 'Link').length};''')
+    check('...and the file still opens, with what belongs to the other pages',
+          r == {'texts': ['Kept 1', 'Kept 3'], 'outline': ['Kept one', 'Kept group', 'Kept three'],
+                'fields': ['both', 'kept'], 'links': 1}, r)
+    del ASKED[:]
+
+    # a photo in a document: saved without its EXIF, and the same way up as before
+    win5.kind = None
+    win5.open_path(os.path.join(FILES, 'photo.docx'))
+    size = ('const im = document.querySelector("#doc img"); if (!im || !document.body.classList.contains("doc")) return null; '
+            'await im.decode(); return [im.naturalWidth, im.naturalHeight]')
+    before = yield ('until', win5, size)
+    clean = os.path.join(OUT, 'photo-saved.docx')
+    ANSWERS.append(clean)
+    yield ('js', win5, 'document.querySelector("#doc img").id = "old"; await Leaflet.mode.save(true, "docx"); return true')
+    deadline = time.time() + 10
+    while not os.path.exists(clean) and time.time() < deadline:
+        yield ('sleep', 0.3)
+    try:
+        photos = [r.data for b in lf.read_docx(open(clean, 'rb').read()).blocks if isinstance(b, lf.Para)
+                  for r in b.runs if isinstance(r, lf.Image)]
+    except Exception as e:  # noqa: BLE001
+        photos = [e]
+    check('a photo is saved without EXIF, GPS, XMP or comments', photos == [fixtures.plain_jpeg(6)], photos)
+    win5.kind = None
+    win5.open_path(clean)
+    after = yield ('until', win5, 'if (document.querySelector("#old")) return null; ' + size)
+    check('...and shows the same way up as before', sorted(before or []) == [8, 16] and after == before, (before, after))
+    del ASKED[:]
+
+    # an encrypted PDF can't be cleaned: say so before saving it
+    win5.kind = None
+    win5.open_path(os.path.join(FILES, 'encrypted.pdf'))
+    r = yield ('until', win5, 'return Leaflet.mode && Leaflet.mode.doc && Leaflet.mode.encrypted && !document.querySelector("#banner").hidden ? document.querySelector("#banner-text").textContent : null')
+    check('an encrypted PDF opens, with a note about its metadata', isinstance(r, str) and 'metadata' in r, r)
+    kept = os.path.join(OUT, 'encrypted-saved.pdf')
+    ANSWERS.append(kept)
+    warning = 'return document.querySelector("#modal").hidden ? null : document.querySelector("#modal .dialog").textContent'
+    yield ('js', win5, 'Leaflet.mode.save(true); return true')
+    r = yield ('until', win5, warning)
+    yield ('shot', win5, '14-encrypted-warning.png')
+    yield ('js', win5, 'document.querySelector("#modal .buttons button:not(.primary)").click(); return true')
+    yield ('sleep', 0.8)
+    check('saving an encrypted PDF warns that its metadata stays, and can be cancelled',
+          isinstance(r, str) and 'encrypted' in r and 'author' in r and not os.path.exists(kept) and not ASKED, (r, ASKED))
+    yield ('js', win5, 'Leaflet.mode.save(true); return true')
+    yield ('until', win5, warning)
+    yield ('js', win5, 'document.querySelector("#modal .buttons button.primary").click(); return true')
+    deadline = time.time() + 10
+    while not os.path.exists(kept) and time.time() < deadline:
+        yield ('sleep', 0.3)
+    yield ('sleep', 0.3)
+    data = open(kept, 'rb').read() if os.path.exists(kept) else b''
+    r = yield ('js', win5, 'return document.querySelector("#status-left").textContent')
+    check('"Save anyway" saves it as it is', data.startswith(b'%PDF') and b'/Encrypt' in data and
+          ASKED == [('save', 'encrypted.pdf')] and 'metadata was kept' in (r or ''), (len(data), ASKED, r))
+    del ASKED[:]
 
     # ---------------------------------------------------------------- themes and the new-document screen
     os.environ['LEAFLET_THEME'] = 'classic'
@@ -388,20 +579,26 @@ def scenario(app):
     yield ('js', win4, 'document.querySelector(".dialog .buttons button").click(); return true')
 
     check('no network request at any point', not HITS, HITS)
-    for w in (win, win2, win3, win4):
+    check('no file dialog was left unanswered', not ASKED and not ANSWERS, (ASKED, ANSWERS))
+    for w in (win, win2, win3, win4, win5):
         w.dirty = False
         w.closing = True
 
 
 def main():
     class TestApp(leaflet.LeafletApp):
-        def do_activate(self):
+        def do_startup(self):
+            leaflet.LeafletApp.do_startup(self)
             self.hold()
             Driver(self, scenario(self))
 
-    # Links are recorded instead of asking and opening a browser.
+    # Links are recorded instead of asking and opening a browser, and the file
+    # dialogs are answered from ANSWERS.
     leaflet.LeafletWindow.confirm_link = lambda self, url: LINKS.append(url)
-    TestApp().run([])
+    Gtk.FileDialog.save, Gtk.FileDialog.save_finish = fake_dialog('save')
+    Gtk.FileDialog.open, Gtk.FileDialog.open_finish = fake_dialog('open')
+    TestApp().run([sys.argv[0], os.path.join(FILES, 'pages.pdf')])
+    check('nothing is left in the temporary folder at the end', not os.listdir(TMP), os.listdir(TMP))
     failed = [r for r in RESULTS if not r[1]]
     print(f'\n{len(RESULTS) - len(failed)} passed, {len(failed)} failed; screenshots in {SHOTS}')
     print(f'peak memory of the main process: {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024} MB')

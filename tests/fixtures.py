@@ -2,28 +2,155 @@
 
     python3 tests/fixtures.py OUTDIR [PORT]
 
-writes sample.docx, sample.odt, sample.rtf, sample.txt, and these PDFs:
+writes sample.docx, sample.odt, sample.rtf, sample.txt, photo.docx (with a
+photo that has EXIF and the rest in it), and these PDFs:
   pages.pdf    5 pages, "Page 1" ... "Page 5", with author/creator metadata
   form.pdf     a form: a text field and a check box
   hostile.pdf  JavaScript that runs on open and on page view, a launch action,
                a link and a remote "go to" that all point at http://127.0.0.1:PORT/
+  refs-*.pdf   3 pages; bookmarks, links, structure tags, form fields, named
+               destinations and the open action all point at page 2
+  encrypted.pdf  protected with an owner password (opens without one)
+  photo.pdf    photos with EXIF, XMP and the rest in them, and a reviewer's note
+and photo-N.jpg (a JPEG full of metadata, EXIF orientation N) with plain-N.jpg
+(the same picture without it).
 """
+import hashlib
+import io
 import os
 import struct
 import sys
+import zipfile
 import zlib
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 import leaflet_formats as lf  # noqa: E402
 
 
-def png(width, height, rgb):
-    """A plain single-colour PNG."""
-    def chunk(kind, data):
-        return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data) & 0xffffffff)
+def png_chunk(kind, data):
+    return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data) & 0xffffffff)
+
+
+def png(width, height, rgb, before=b'', after=b''):
+    """A plain single-colour PNG; `before` and `after` are more chunks, around the picture data."""
     raw = b''.join(b'\x00' + bytes(rgb) * width for _ in range(height))
-    return (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', width, height, 8, 2, 0, 0, 0)) +
-            chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b''))
+    return (b'\x89PNG\r\n\x1a\n' + png_chunk(b'IHDR', struct.pack('>IIBBBBB', width, height, 8, 2, 0, 0, 0)) + before +
+            png_chunk(b'IDAT', zlib.compress(raw)) + after + png_chunk(b'IEND', b''))
+
+
+def jpeg_segment(marker, body):
+    return bytes([0xFF, marker]) + struct.pack('>H', len(body) + 2) + body
+
+
+def jpeg(width, height, segments=(), levels=(60, 200)):
+    """A small grey JPEG, written out by hand: the left half dark, the right
+    half light. `segments` go in right after the start of the file."""
+    cols, rows = (width + 7) // 8, (height + 7) // 8
+    bits = []
+    previous = 0
+    for _ in range(rows):
+        for col in range(cols):
+            dc = levels[0 if col < cols / 2 else 1] - 128      # one flat 8x8 block: only its average is stored
+            diff, previous = dc - previous, dc
+            size = abs(diff).bit_length()
+            bits.append(f'{size:04b}')                          # the size, in the Huffman table below
+            if size:
+                bits.append(f'{diff if diff > 0 else diff + (1 << size) - 1:0{size}b}')
+            bits.append('0')                                    # "nothing else in this block"
+    stream = ''.join(bits)
+    stream += '1' * (-len(stream) % 8)
+    scan = bytes(int(stream[i:i + 8], 2) for i in range(0, len(stream), 8)).replace(b'\xff', b'\xff\x00')
+    return (b'\xff\xd8' + b''.join(segments) +
+            jpeg_segment(0xDB, b'\x00' + b'\x08' * 64) +
+            jpeg_segment(0xC0, struct.pack('>BHHB', 8, height, width, 1) + b'\x01\x11\x00') +
+            jpeg_segment(0xC4, b'\x00' + bytes([0, 0, 0, 9] + [0] * 12) + bytes(range(9))) +
+            jpeg_segment(0xC4, b'\x10' + bytes([1] + [0] * 15) + b'\x00') +
+            jpeg_segment(0xDA, b'\x01\x01\x00\x00\x3f\x00') + scan + b'\xff\xd9')
+
+
+def exif(orientation, order='<'):
+    """EXIF data the way a camera writes it: maker, which way up, and a GPS position."""
+    maker = b'Sample Camera\x00'
+    head = (b'II' if order == '<' else b'MM') + struct.pack(order + 'HI', 42, 8)
+    after = 8 + 2 + 3 * 12 + 4
+    ifd = struct.pack(order + 'H', 3)
+    ifd += struct.pack(order + 'HHII', 0x010F, 2, len(maker), after)
+    ifd += struct.pack(order + 'HHIHH', 0x0112, 3, 1, orientation, 0)
+    ifd += struct.pack(order + 'HHII', 0x8825, 4, 1, after + len(maker))
+    gps = struct.pack(order + 'H', 1) + struct.pack(order + 'HHI', 1, 2, 2) + b'N\x00\x00\x00' + struct.pack(order + 'I', 0)
+    return head + ifd + struct.pack(order + 'I', 0) + maker + gps
+
+
+JFIF = jpeg_segment(0xE0, b'JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00')
+ICC = jpeg_segment(0xE2, b'ICC_PROFILE\x00\x01\x01' + b'sample colour profile')
+ADOBE = jpeg_segment(0xEE, b'Adobe\x00\x64\x00\x00\x00\x00\x00')
+# What a picture must not carry into a saved document.
+PHOTO_MARKS = (b'Sample Camera', b'Sample Photographer', b'Sample caption', b'Sample comment', b'Sample thumbnail',
+               b'Sample second picture', b'Sample trailing data', b'Sample Author', b'Sample private', b'GPS', b'N\x00\x00\x00')
+
+
+def photo_jpeg(orientation=6, width=16, height=8):
+    """A JPEG with everything a phone and a photo editor put into one."""
+    return jpeg(width, height, [
+        JFIF,
+        jpeg_segment(0xE0, b'JFXX\x00\x13Sample thumbnail'),
+        jpeg_segment(0xE1, b'Exif\x00\x00' + exif(orientation)),
+        jpeg_segment(0xE1, b'http://ns.adobe.com/xap/1.0/\x00<x:xmpmeta><dc:creator>Sample Photographer</dc:creator>'
+                           b'<exif:GPSLatitude>GPS 1,2N</exif:GPSLatitude></x:xmpmeta>'),
+        ICC,
+        jpeg_segment(0xE2, b'MPF\x00Sample second picture'),
+        jpeg_segment(0xED, b'Photoshop 3.0\x008BIM\x04\x04\x00\x00\x00\x00\x00\x10Sample caption'),
+        ADOBE,
+        jpeg_segment(0xFE, b'Sample comment'),
+    ]) + b'Sample trailing data'
+
+
+def plain_jpeg(orientation=6, width=16, height=8):
+    """photo_jpeg() with only what the picture needs to look the same."""
+    keep = [JFIF]
+    if orientation != 1:
+        keep.append(jpeg_segment(0xE1, b'Exif\x00\x00MM\x00\x2a\x00\x00\x00\x08\x00\x01\x01\x12\x00\x03\x00\x00\x00\x01' +
+                                 bytes([0, orientation, 0, 0, 0, 0, 0, 0])))
+    return jpeg(width, height, keep + [ICC, ADOBE])
+
+
+PNG_COLOUR = png_chunk(b'gAMA', struct.pack('>I', 45455)) + png_chunk(b'pHYs', struct.pack('>IIB', 3780, 3780, 1))
+
+
+def photo_png(orientation=6, order='>'):
+    """A PNG with text, a date, EXIF and a program's own chunk in it."""
+    before = (png_chunk(b'tEXt', b'Author\x00Sample Author') + PNG_COLOUR +
+              png_chunk(b'iTXt', b'XML:com.adobe.xmp\x00\x00\x00\x00\x00<x:xmpmeta>Sample Photographer</x:xmpmeta>') +
+              png_chunk(b'zTXt', b'Comment\x00\x00' + zlib.compress(b'Sample comment')) +
+              png_chunk(b'tIME', struct.pack('>HBBBBB', 2020, 1, 1, 0, 0, 0)) +
+              png_chunk(b'prVt', b'Sample private'))
+    after = png_chunk(b'eXIf', exif(orientation, order)) + png_chunk(b'tEXt', b'Software\x00Sample Camera')
+    return png(24, 12, (30, 120, 60), before, after) + b'Sample trailing data'
+
+
+def plain_png(orientation=6):
+    turned = b'' if orientation == 1 else png_chunk(
+        b'eXIf', b'MM\x00\x2a\x00\x00\x00\x08\x00\x01\x01\x12\x00\x03\x00\x00\x00\x01' + bytes([0, orientation, 0, 0, 0, 0, 0, 0]))
+    return png(24, 12, (30, 120, 60), PNG_COLOUR + turned)
+
+
+def gif(extras=(), tail=b''):
+    """A two-pixel GIF; `extras` are blocks in front of the picture."""
+    return (b'GIF89a' + struct.pack('<HHBBB', 2, 1, 0x80, 0, 0) + b'\x00\x00\x00\xff\xff\xff' + b''.join(extras) +
+            b'\x21\xf9\x04\x00\x00\x00\x00\x00' + b'\x2c' + struct.pack('<HHHHB', 0, 0, 2, 1, 0) +
+            b'\x02\x02\x44\x0a\x00' + b';' + tail)
+
+
+GIF_LOOP = b'\x21\xff\x0bNETSCAPE2.0\x03\x01\x00\x00\x00'
+
+
+def photo_gif():
+    return gif([GIF_LOOP, b'\x21\xfe\x0eSample comment\x00',
+                b'\x21\xff\x0bXMP DataXMP\x13Sample Photographer\x00'], b'Sample trailing data')
+
+
+def plain_gif():
+    return gif([GIF_LOOP])
 
 
 # ------------------------------------------------------------------ DOCX, the way Word writes it
@@ -176,7 +303,7 @@ class PdfWriter:
     def stream(self, data, extra=''):
         return self.add(f'<< /Length {len(data)} {extra}>>\nstream\n'.encode() + data + b'\nendstream')
 
-    def bytes(self, root, info=None):
+    def bytes(self, root, info=None, trailer=''):
         out = bytearray(b'%PDF-1.7\n%\xe2\xe3\xcf\xd3\n')
         offsets = []
         for n, body in enumerate(self.objects, 1):
@@ -187,7 +314,7 @@ class PdfWriter:
         for off in offsets:
             out += f'{off:010d} 00000 n \n'.encode()
         info_ref = f' /Info {info} 0 R' if info else ''
-        out += f'trailer\n<< /Size {len(self.objects) + 1} /Root {root} 0 R{info_ref} >>\nstartxref\n{xref}\n%%EOF\n'.encode()
+        out += f'trailer\n<< /Size {len(self.objects) + 1} /Root {root} 0 R{info_ref}{trailer} >>\nstartxref\n{xref}\n%%EOF\n'.encode()
         return bytes(out)
 
 
@@ -234,6 +361,212 @@ def form_pdf():
     return w.bytes(root)
 
 
+# Everything that belongs to page 2 of refs_pdf() carries this, so a test can
+# tell whether anything of the page is left in a file after it's deleted.
+REMOVED_MARK = 'ZQXJ'
+REMOVED_IMAGE = b'IMGZQXJ!' * 8
+REF_KINDS = ('outline', 'link', 'struct', 'form', 'names', 'open')
+
+
+def refs_pdf(kinds=REF_KINDS):
+    """Three pages, with the kinds of reference to page 2 that are asked for."""
+    w = PdfWriter()
+    pages = w.add('')
+    font = w.add('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>')
+    p1, p2, p3 = w.add(''), w.add(''), w.add('')
+    image = w.stream(REMOVED_IMAGE, '/Type /XObject /Subtype /Image /Width 8 /Height 8 /ColorSpace /DeviceGray '
+                                    '/BitsPerComponent 8 ')
+    body = zlib.compress(f'BT /F1 24 Tf 72 700 Td (Removed page {REMOVED_MARK}) Tj ET '
+                         'q 64 0 0 64 72 500 cm /Im1 Do Q'.encode())
+    contents = {p1: w.stream(b'BT /F1 24 Tf 72 700 Td (Kept 1) Tj ET'), p2: w.stream(body, '/Filter /FlateDecode '),
+                p3: w.stream(b'BT /F1 24 Tf 72 700 Td (Kept 3) Tj ET')}
+    annots = {p1: [], p2: [], p3: []}
+    catalog = [f'/Type /Catalog /Pages {pages} 0 R']
+    note = w.add(f'<< /Type /Annot /Subtype /Text /Rect [72 400 92 420] /P {p2} 0 R /Contents (Removed note {REMOVED_MARK}) >>')
+    annots[p2].append(note)
+
+    if 'names' in kinds:
+        leaf = w.add(f'<< /Limits [(to2) (to3)] /Names [(to2) [{p2} 0 R /Fit] (to3) << /D [{p3} 0 R /Fit] >>] >>')
+        tree = w.add(f'<< /Kids [{leaf} 0 R] >>')
+        catalog.append(f'/Names << /Dests {tree} 0 R >> /Dests << /old2 [{p2} 0 R /Fit] /old3 [{p3} 0 R /Fit] >>')
+
+    if 'outline' in kinds:
+        root = w.add('')
+        named = '/Dest (to2)' if 'names' in kinds else f'/Dest [{p2} 0 R /Fit]'
+        # (title, where it goes, children)
+        items = [('Kept one', f'/Dest [{p1} 0 R /Fit]', []),
+                 (f'Removed chapter {REMOVED_MARK}', f'/Dest [{p2} 0 R /XYZ 0 792 0]',
+                  [(f'Removed section {REMOVED_MARK}', f'/A << /S /GoTo /D [{p2} 0 R /Fit] >>', [])]),
+                 (f'Removed by name {REMOVED_MARK}', named, []),
+                 ('Kept group', '', [(f'Removed leaf {REMOVED_MARK}', f'/Dest [{p2} 0 R /Fit]', []),
+                                     ('Kept leaf', f'/Dest [{p3} 0 R /Fit]', [])]),
+                 ('Kept three', f'/Dest [{p3} 0 R /Fit]', [])]
+
+        def level(entries, parent):
+            refs = [w.add('') for _ in entries]
+            for n, (ref, (title, dest, kids)) in enumerate(zip(refs, entries)):
+                links = f'/Parent {parent} 0 R'
+                if n:
+                    links += f' /Prev {refs[n - 1]} 0 R'
+                if n + 1 < len(refs):
+                    links += f' /Next {refs[n + 1]} 0 R'
+                if kids:
+                    below = level(kids, ref)
+                    links += f' /First {below[0]} 0 R /Last {below[-1]} 0 R /Count {len(below)}'
+                w.set(ref, f'<< /Title ({title}) {dest} {links} >>')
+            return refs
+        top = level(items, root)
+        w.set(root, f'<< /Type /Outlines /First {top[0]} 0 R /Last {top[-1]} 0 R /Count 8 >>')
+        catalog.append(f'/Outlines {root} 0 R')
+
+    if 'link' in kinds:
+        link = '<< /Type /Annot /Subtype /Link /Rect [72 %d 300 %d] /Border [0 0 1] %s >>'
+        annots[p1].append(w.add(link % (600, 620, f'/Dest [{p2} 0 R /Fit]')))
+        annots[p1].append(w.add(link % (560, 580, f'/A << /S /GoTo /D [{p3} 0 R /Fit] >>')))
+        annots[p3].append(w.add(link % (600, 620, f'/A << /S /GoTo /D [{p2} 0 R /Fit] >>')))
+        annots[p3].append(w.add(link % (560, 580, f'/Dest [{p1} 0 R /Fit]')))
+
+    if 'form' in kinds:
+        def field(page, y, rest):
+            ref = w.add(f'<< /Type /Annot /Subtype /Widget /Rect [72 {y} 372 {y + 30}] /P {page} 0 R /F 4 '
+                        f'/DA (/Helv 14 Tf 0 g) {rest} >>')
+            annots[page].append(ref)
+            return ref
+        kept = field(p1, 300, '/FT /Tx /T (kept) /V (Kept value)')
+        gone = field(p2, 300, f'/FT /Tx /T (gone) /V (Removed value {REMOVED_MARK})')
+        group = w.add('')
+        kid1 = field(p1, 200, f'/Parent {group} 0 R')
+        kid2 = field(p2, 200, f'/Parent {group} 0 R')
+        w.set(group, f'<< /FT /Tx /T (both) /V (On two pages) /Kids [{kid1} 0 R {kid2} 0 R] >>')
+        alone = w.add('')
+        kid3 = field(p2, 100, f'/Parent {alone} 0 R')
+        w.set(alone, f'<< /FT /Tx /T (alone) /V (Removed group {REMOVED_MARK}) /Kids [{kid3} 0 R] >>')
+        helv = w.add('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>')
+        catalog.append(f'/AcroForm << /Fields [{kept} 0 R {gone} 0 R {group} 0 R {alone} 0 R] /CO [{gone} 0 R {kept} 0 R] '
+                       f'/DA (/Helv 12 Tf 0 g) /DR << /Font << /Helv {helv} 0 R >> >> >>')
+
+    struct_parents = {}
+    if 'struct' in kinds:
+        root, doc = w.add(''), w.add('')
+        e1 = w.add(f'<< /Type /StructElem /S /P /P {doc} 0 R /Pg {p1} 0 R /K 0 >>')
+        e2 = w.add(f'<< /Type /StructElem /S /P /P {doc} 0 R /Pg {p2} 0 R /K [0 << /Type /MCR /Pg {p2} 0 R /MCID 1 >>] '
+                   f'/ActualText (Removed text {REMOVED_MARK}) >>')
+        sect = w.add('')
+        span = w.add(f'<< /Type /StructElem /S /Span /P {sect} 0 R /Pg {p2} 0 R /K 2 /Alt (Removed alt {REMOVED_MARK}) >>')
+        w.set(sect, f'<< /Type /StructElem /S /Sect /P {doc} 0 R /T (Removed part {REMOVED_MARK}) /K {span} 0 R >>')
+        e3 = w.add(f'<< /Type /StructElem /S /P /P {doc} 0 R /Pg {p3} 0 R /K 0 >>')
+        e4 = w.add(f'<< /Type /StructElem /S /Annot /P {doc} 0 R /T (Removed tag {REMOVED_MARK}) '
+                   f'/K << /Type /OBJR /Obj {note} 0 R >> >>')
+        mixed = w.add(f'<< /Type /StructElem /S /Div /P {doc} 0 R /Pg {p2} 0 R '
+                      f'/K [3 << /Type /MCR /Pg {p3} 0 R /MCID 1 >>] >>')
+        w.set(doc, f'<< /Type /StructElem /S /Document /P {root} 0 R '
+                   f'/K [{e1} 0 R {e2} 0 R {sect} 0 R {e3} 0 R {e4} 0 R {mixed} 0 R] >>')
+        tree = w.add(f'<< /Nums [0 [{e1} 0 R] 1 [{e2} 0 R {e2} 0 R {span} 0 R {mixed} 0 R] 2 [{e3} 0 R {mixed} 0 R] 3 {e4} 0 R] >>')
+        w.set(root, f'<< /Type /StructTreeRoot /K {doc} 0 R /ParentTree {tree} 0 R /ParentTreeNextKey 4 >>')
+        w.set(note, f'<< /Type /Annot /Subtype /Text /Rect [72 400 92 420] /Contents (Removed note {REMOVED_MARK}) '
+                    '/StructParent 3 >>')
+        catalog.append(f'/StructTreeRoot {root} 0 R /MarkInfo << /Marked true >>')
+        struct_parents = {p1: 0, p2: 1, p3: 2}
+
+    if 'open' in kinds:
+        catalog.append(f'/OpenAction [{p2} 0 R /Fit]')
+
+    for page in (p1, p2, p3):
+        extra = f'/Annots [{" ".join(f"{a} 0 R" for a in annots[page])}] ' if annots[page] else ''
+        if page in struct_parents:
+            extra += f'/StructParents {struct_parents[page]} '
+        xobject = f'/XObject << /Im1 {image} 0 R >> ' if page == p2 else ''
+        w.set(page, f'<< /Type /Page /Parent {pages} 0 R /MediaBox [0 0 612 792] '
+                    f'/Resources << /Font << /F1 {font} 0 R >> {xobject}>> /Contents {contents[page]} 0 R {extra}>>')
+    w.set(pages, f'<< /Type /Pages /Kids [{p1} 0 R {p2} 0 R {p3} 0 R] /Count 3 >>')
+    return w.bytes(w.add(f'<< {" ".join(catalog)} >>'))
+
+
+def photo_docx():
+    """sample.docx with a photo straight from a camera where its picture was."""
+    with zipfile.ZipFile(io.BytesIO(sample_docx())) as z:
+        return lf.make_zip([(name, photo_jpeg(6) if name == 'word/media/image1.png' else z.read(name))
+                            for name in z.namelist()])
+
+
+def photo_pdf():
+    """One page with photos as a scanner or a phone app puts them in (EXIF and
+    all, and an XMP packet of their own), and a reviewer's note."""
+    w = PdfWriter()
+    pages = w.add('')
+    font = w.add('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>')
+    page = w.add('')
+    xmp = w.stream(b'<?xpacket begin=""?><x:xmpmeta xmlns:x="adobe:ns:meta/"><dc:creator>Sample Photographer</dc:creator>'
+                   b'</x:xmpmeta><?xpacket end="w"?>', '/Type /Metadata /Subtype /XML ')
+    private = w.add('<< /SampleApp << /LastModified (D:20200101000000Z) /Private (Sample private) >> >>')
+    image = '/Type /XObject /Subtype /Image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 '
+    im1 = w.stream(photo_jpeg(6), f'{image}/Filter /DCTDecode /Metadata {xmp} 0 R /PieceInfo {private} 0 R '
+                                  '/LastModified (D:20200101000000Z) ')
+    im2 = w.stream(photo_jpeg(1), f'{image}/Filter [/DCTDecode] ')
+    popup = w.add('')
+    note = w.add(f'<< /Type /Annot /Subtype /Text /Rect [72 400 92 420] /Contents (A note that stays) /T (Sample Reviewer) '
+                 f'/NM (sample-note-id) /M (D:20200101000000Z) /CreationDate (D:20200101000000Z) /Popup {popup} 0 R >>')
+    w.set(popup, f'<< /Type /Annot /Subtype /Popup /Rect [100 300 300 400] /Parent {note} 0 R /T (Sample Reviewer) '
+                 '/M (D:20200101000000Z) >>')
+    reply = w.add(f'<< /Type /Annot /Subtype /FreeText /Rect [72 300 300 330] /Contents (A reply that stays) '
+                  f'/T (Sample Reviewer) /IRT {note} 0 R /DA (/Helv 12 Tf 0 g) /CreationDate (D:20200101000000Z) >>')
+    field = w.add(f'<< /Type /Annot /Subtype /Widget /FT /Tx /T (name) /V (A value) /Rect [72 600 372 630] '
+                  f'/P {page} 0 R /F 4 /DA (/Helv 14 Tf 0 g) /M (D:20200101000000Z) >>')
+    content = w.stream(b'BT /F1 18 Tf 72 700 Td (Two photos) Tj ET q 160 0 0 80 72 480 cm /Im1 Do Q '
+                       b'q 160 0 0 80 300 480 cm /Im2 Do Q')
+    w.set(page, f'<< /Type /Page /Parent {pages} 0 R /MediaBox [0 0 612 792] /Contents {content} 0 R '
+                f'/Resources << /Font << /F1 {font} 0 R >> /XObject << /Im1 {im1} 0 R /Im2 {im2} 0 R >> >> '
+                f'/Annots [{note} 0 R {popup} 0 R {reply} 0 R {field} 0 R] /LastModified (D:20200101000000Z) >>')
+    w.set(pages, f'<< /Type /Pages /Kids [{page} 0 R] /Count 1 >>')
+    helv = w.add('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>')
+    root = w.add(f'<< /Type /Catalog /Pages {pages} 0 R /AcroForm << /Fields [{field} 0 R] '
+                 f'/DA (/Helv 12 Tf 0 g) /DR << /Font << /Helv {helv} 0 R >> >> >> >>')
+    return w.bytes(root)
+
+
+def rc4(key, data):
+    box = list(range(256))
+    j = 0
+    for i in range(256):
+        j = (j + box[i] + key[i % len(key)]) & 255
+        box[i], box[j] = box[j], box[i]
+    out = bytearray()
+    i = j = 0
+    for byte in data:
+        i = (i + 1) & 255
+        j = (j + box[i]) & 255
+        box[i], box[j] = box[j], box[i]
+        out.append(byte ^ box[(box[i] + box[j]) & 255])
+    return bytes(out)
+
+
+def encrypted_pdf():
+    """A PDF protected the old, simple way (40-bit RC4) with an owner password
+    and no password needed to open it; it has an author in its document info."""
+    pad = bytes.fromhex('28bf4e5e4e758a4164004e56fffa01082e2e00b6d0683e802f0ca9fe6453697a')
+    file_id = hashlib.md5(b'leaflet test file').digest()
+    permissions = struct.pack('<i', -44)
+    owner = rc4(hashlib.md5((b'owner' + pad)[:32]).digest()[:5], pad)
+    key = hashlib.md5(pad + owner + permissions + file_id).digest()[:5]
+    user = rc4(key, pad)
+
+    def secret(num, data):
+        return rc4(hashlib.md5(key + struct.pack('<I', num)[:3] + b'\x00\x00').digest()[:10], data)
+    w = PdfWriter()
+    pages = w.add('')
+    font = w.add('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>')
+    content = len(w.objects) + 1
+    w.stream(secret(content, b'BT /F1 24 Tf 72 700 Td (An encrypted page) Tj ET'))
+    page = w.add(f'<< /Type /Page /Parent {pages} 0 R /MediaBox [0 0 612 792] '
+                 f'/Resources << /Font << /F1 {font} 0 R >> >> /Contents {content} 0 R >>')
+    w.set(pages, f'<< /Type /Pages /Kids [{page} 0 R] /Count 1 >>')
+    root = w.add(f'<< /Type /Catalog /Pages {pages} 0 R >>')
+    info = len(w.objects) + 1
+    w.add(f'<< /Title <{secret(info, b"Encrypted sample").hex()}> /Author <{secret(info, b"Sample Author").hex()}> >>')
+    encrypt = w.add(f'<< /Filter /Standard /V 1 /R 2 /O <{owner.hex()}> /U <{user.hex()}> /P -44 >>')
+    return w.bytes(root, info, f' /Encrypt {encrypt} 0 R /ID [<{file_id.hex()}> <{file_id.hex()}>]')
+
+
 def hostile_pdf(port):
     url = f'http://127.0.0.1:{port}'
     w = PdfWriter()
@@ -269,8 +602,12 @@ def write_all(out, port=8765):
         'sample.docx': sample_docx(), 'sample.odt': sample_odt(), 'sample.rtf': SAMPLE_RTF,
         'sample.txt': 'First line\nSecond line\n\nAfter an empty line\n'.encode(),
         'pages.pdf': pages_pdf(), 'extra.pdf': pages_pdf(2, 'Extra'), 'form.pdf': form_pdf(),
-        'hostile.pdf': hostile_pdf(port),
+        'hostile.pdf': hostile_pdf(port), 'refs-all.pdf': refs_pdf(), 'photo.pdf': photo_pdf(), 'photo.docx': photo_docx(),
+        'encrypted.pdf': encrypted_pdf(),
+        'photo-1.jpg': photo_jpeg(1), 'plain-1.jpg': plain_jpeg(1), 'photo-6.jpg': photo_jpeg(6), 'plain-6.jpg': plain_jpeg(6),
     }
+    for kind in REF_KINDS:
+        files[f'refs-{kind}.pdf'] = refs_pdf((kind,))
     for name, data in files.items():
         with open(os.path.join(out, name), 'wb') as f:
             f.write(data)

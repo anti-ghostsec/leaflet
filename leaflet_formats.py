@@ -7,8 +7,9 @@ super/subscript, alignment, links, lists, simple tables, pictures and page
 breaks. Everything else (comments, tracked changes, headers and footers,
 footnotes, text boxes...) is reported as a warning when the file is opened.
 
-Written files carry no author, dates, program name or other metadata, and
-the zip entries all have the same fixed timestamp.
+Written files carry no author, dates, program name or other metadata, the
+zip entries all have the same fixed timestamp, and pictures are written
+without their EXIF, XMP, IPTC, comments and text (see strip_image_metadata).
 
 Only the Python standard library is used. Files are untrusted: zip members
 are size-checked before they're read, XML with a DOCTYPE is refused, and the
@@ -19,9 +20,11 @@ import html
 import io
 import re
 import zipfile
+import zlib
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from xml.etree import ElementTree as ET
+from xml.parsers import expat
 
 MAX_MEMBER = 64 * 1024 * 1024       # one file inside a document
 MAX_TOTAL = 256 * 1024 * 1024       # everything inside a document
@@ -36,6 +39,9 @@ IMAGE_TYPES = {  # mime -> file extension
 
 class FormatError(Exception):
     """The file can't be read as the format it claims to be."""
+
+
+_DOCTYPE_REFUSED = 'the document contains a DOCTYPE, which Leaflet refuses to read'
 
 
 # ---------------------------------------------------------------- the model
@@ -172,12 +178,34 @@ def read_member(z, name, required=True):
 
 
 def parse_xml(data: bytes):
-    # No DOCTYPE means no entities, so no entity expansion tricks.
+    """Parse XML that has no DOCTYPE: no DTD means no entities to expand.
+
+    The parser itself refuses the declarations, so it doesn't matter how the
+    file is encoded (UTF-16 would hide them from a search through the bytes).
+    """
     if re.search(rb'<!(DOCTYPE|ENTITY)', data, re.I):
-        raise FormatError('the document contains a DOCTYPE, which Leaflet refuses to read')
+        raise FormatError(_DOCTYPE_REFUSED)
+    builder = ET.TreeBuilder()
+    parser = expat.ParserCreate(namespace_separator='}')
+    parser.buffer_text = True
+
+    def name(n):
+        return '{' + n if '}' in n else n
+
+    def refuse(*_):
+        raise FormatError(_DOCTYPE_REFUSED)
+
+    parser.StartElementHandler = lambda tag, attrs: builder.start(name(tag), {name(k): v for k, v in attrs.items()})
+    parser.EndElementHandler = lambda tag: builder.end(name(tag))
+    parser.CharacterDataHandler = builder.data
+    parser.StartDoctypeDeclHandler = refuse
+    parser.EntityDeclHandler = refuse
+    parser.UnparsedEntityDeclHandler = refuse
+    parser.NotationDeclHandler = refuse
     try:
-        return ET.fromstring(data)
-    except ET.ParseError as e:
+        parser.Parse(data, True)
+        return builder.close()
+    except (expat.ExpatError, ET.ParseError, AssertionError, LookupError, ValueError) as e:
         raise FormatError(f'broken XML: {e}') from e
 
 
@@ -910,7 +938,7 @@ class _DocxWriter:
             return ''
         self.pic_id += 1
         name = f'image{self.pic_id}.{ext}'
-        self.media.append((name, im.data))
+        self.media.append((name, strip_image_metadata(im.data, im.mime)))
         rid = self.rel('image', f'media/{name}')
         wpx, hpx = im.width or image_size(im.data)[0] or 200, im.height or image_size(im.data)[1] or 150
         if wpx > 624:   # keep within the page's text width (6.5 in)
@@ -990,6 +1018,186 @@ def image_size(data):
     except (IndexError, ValueError):
         pass
     return 0, 0
+
+
+# ---------------------------------------------------------------- pictures without their metadata
+
+# A photo carries where and when it was taken, the camera, sometimes a
+# thumbnail of the uncropped picture. Pictures are written into documents
+# without any of that. The pixel data is copied as it is, never re-encoded.
+#
+# What stays is what the picture needs to look the same: its colour profile
+# (ICC), JFIF and Adobe colour markers, and the one EXIF field that says which
+# way up it is (Orientation), on its own in a fresh EXIF block; programs
+# disagree about whether to turn a picture by it, and with the field kept
+# each goes on showing the picture the way it did before.
+
+def strip_image_metadata(data: bytes, mime: str = '') -> bytes:
+    """The same picture without EXIF, XMP, IPTC, comments, text or dates.
+    A file that can't be followed to its end is returned as it was."""
+    try:
+        if data.startswith(b'\xff\xd8'):
+            return _strip_jpeg(data)
+        if data.startswith(b'\x89PNG\r\n\x1a\n'):
+            return _strip_png(data)
+        if data[:6] in (b'GIF87a', b'GIF89a'):
+            return _strip_gif(data)
+    except (IndexError, ValueError):
+        pass
+    return data
+
+
+def _exif_orientation(tiff: bytes) -> int:
+    """The Orientation (1-8) in an EXIF block's TIFF data; 1, upright, if there's none."""
+    order = {b'II': 'little', b'MM': 'big'}.get(bytes(tiff[:2]))
+    if not order or int.from_bytes(tiff[2:4], order) != 42:
+        return 1
+    ifd = int.from_bytes(tiff[4:8], order)
+    count = int.from_bytes(tiff[ifd:ifd + 2], order) if ifd + 2 <= len(tiff) else 0
+    for n in range(min(count, 512)):
+        entry = tiff[ifd + 2 + 12 * n:ifd + 14 + 12 * n]
+        if len(entry) == 12 and int.from_bytes(entry[:2], order) == 0x0112:
+            value = int.from_bytes(entry[8:10], order)
+            if int.from_bytes(entry[2:4], order) == 3 and int.from_bytes(entry[4:8], order) == 1 and 1 <= value <= 8:
+                return value
+            break
+    return 1
+
+
+def _orientation_exif(orientation: int) -> bytes:
+    """EXIF (TIFF) data with the Orientation field and nothing else."""
+    return (b'MM\x00\x2a\x00\x00\x00\x08' + b'\x00\x01' +
+            b'\x01\x12\x00\x03\x00\x00\x00\x01' + bytes([0, orientation, 0, 0]) + b'\x00\x00\x00\x00')
+
+
+def _strip_jpeg(data: bytes) -> bytes:
+    out = [b'\xff\xd8']
+    kept = []           # segments in front of the picture data, in their order
+    orientation = 1
+    i, n = 2, len(data)
+    while True:
+        if i + 1 >= n or data[i] != 0xFF:
+            raise ValueError('not a JPEG marker')
+        marker = data[i + 1]
+        if marker == 0xFF:                      # padding
+            i += 1
+            continue
+        if marker == 0xD9:                      # end of image; anything after it is dropped
+            kept.append(b'\xff\xd9')
+            break
+        if marker == 0x01 or 0xD0 <= marker <= 0xD7:
+            kept.append(data[i:i + 2])
+            i += 2
+            continue
+        size = int.from_bytes(data[i + 2:i + 4], 'big')
+        if size < 2 or i + 2 + size > n:
+            raise ValueError('JPEG segment runs past the end')
+        body = data[i + 4:i + 2 + size]
+        end = i + 2 + size
+        if marker == 0xDA:                      # a scan: its compressed data follows, up to the next marker
+            while True:
+                end = data.find(b'\xff', end)
+                if end < 0 or end + 1 >= n:     # cut short, as files sometimes are: all of it is picture data
+                    end = n
+                    break
+                if data[end + 1] == 0x00 or 0xD0 <= data[end + 1] <= 0xD7:
+                    end += 2
+                elif data[end + 1] == 0xFF:
+                    end += 1
+                else:
+                    break
+            kept.append(data[i:end])
+            if end == n:
+                break
+        elif marker == 0xE1 and body.startswith(b'Exif\x00\x00'):
+            orientation = _exif_orientation(body[6:])
+        elif marker == 0xFE or 0xE0 <= marker <= 0xEF:
+            # Comments and application data go, except what decides the colours.
+            if ((marker == 0xE0 and body.startswith(b'JFIF\x00')) or
+                    (marker == 0xE2 and body.startswith(b'ICC_PROFILE\x00')) or
+                    (marker == 0xEE and body.startswith(b'Adobe'))):
+                kept.append(data[i:end])
+        else:
+            kept.append(data[i:end])
+        i = end
+    if orientation != 1:
+        exif = b'Exif\x00\x00' + _orientation_exif(orientation)
+        block = b'\xff\xe1' + (len(exif) + 2).to_bytes(2, 'big') + exif
+        # EXIF goes first, or right after the JFIF header when there is one.
+        at = 1 if kept and kept[0][:2] == b'\xff\xe0' else 0
+        kept.insert(at, block)
+    return b''.join(out + kept)
+
+
+# PNG chunks that make the picture and its colours; every other chunk (text,
+# dates, EXIF, anything a program added for itself) is left out.
+_PNG_KEEP = {b'IHDR', b'PLTE', b'IDAT', b'IEND', b'tRNS', b'gAMA', b'cHRM', b'sRGB', b'iCCP', b'sBIT', b'bKGD',
+             b'pHYs', b'hIST', b'sPLT', b'cICP', b'mDCv', b'cLLi', b'acTL', b'fcTL', b'fdAT'}
+
+
+def _strip_png(data: bytes) -> bytes:
+    def chunk(kind, body):
+        return len(body).to_bytes(4, 'big') + kind + body + (zlib.crc32(kind + body) & 0xffffffff).to_bytes(4, 'big')
+    chunks = []
+    orientation = 1
+    i, n = 8, len(data)
+    while True:
+        if i + 12 > n:
+            raise ValueError('PNG ends in the middle of a chunk')
+        size = int.from_bytes(data[i:i + 4], 'big')
+        kind = data[i + 4:i + 8]
+        end = i + 12 + size
+        if end > n:
+            raise ValueError('PNG chunk runs past the end')
+        if kind == b'eXIf':
+            orientation = _exif_orientation(data[i + 8:i + 8 + size])
+        elif kind in _PNG_KEEP:
+            chunks.append((kind, data[i:end]))
+        i = end
+        if kind == b'IEND':             # anything after it is dropped
+            break
+    out = [data[:8]]
+    for kind, raw in chunks:
+        if kind == b'IDAT' and orientation != 1:      # goes in front of the picture data
+            out.append(chunk(b'eXIf', _orientation_exif(orientation)))
+            orientation = 1
+        out.append(raw)
+    return b''.join(out)
+
+
+def _strip_gif(data: bytes) -> bytes:
+    def table(flags):
+        return 3 << ((flags & 7) + 1) if flags & 0x80 else 0
+
+    def blocks(at):
+        """The end of a run of data sub-blocks that starts at `at`."""
+        while data[at]:
+            at += 1 + data[at]
+        return at + 1
+    i = 13 + table(data[10])
+    out = [data[:i]]
+    while True:
+        kind = data[i]
+        if kind == 0x3B:                        # the end; anything after it is dropped
+            out.append(b';')
+            break
+        if kind == 0x2C:                        # a picture
+            end = blocks(i + 10 + table(data[i + 9]) + 1)
+            out.append(data[i:end])
+        elif kind == 0x21:
+            label = data[i + 1]
+            end = blocks(i + 2)
+            # Comments go, and so do applications' own blocks (XMP is one),
+            # other than the ones that make an animation repeat and the colour profile.
+            if label in (0xF9, 0x01) or (label == 0xFF and data[i + 3:i + 14] in (
+                    b'NETSCAPE2.0', b'ANIMEXTS1.0', b'ICCRGBG1012')):
+                out.append(data[i:end])
+        else:
+            raise ValueError('not a GIF block')
+        if end > len(data):
+            raise ValueError('GIF block runs past the end')
+        i = end
+    return b''.join(out)
 
 
 # ---------------------------------------------------------------- ODT in
@@ -1479,7 +1687,7 @@ class _OdtWriter:
             return ''
         n = len(self.pictures) + 1
         path = f'Pictures/image{n}.{ext}'
-        self.pictures.append((path, im.mime, im.data))
+        self.pictures.append((path, im.mime, strip_image_metadata(im.data, im.mime)))
         wpx, hpx = im.width or image_size(im.data)[0] or 200, im.height or image_size(im.data)[1] or 150
         if wpx > 604:
             hpx = int(hpx * 604 / wpx)

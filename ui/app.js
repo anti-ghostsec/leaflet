@@ -259,7 +259,7 @@ function about() {
 <li>A PDF's own scripts never run: Leaflet doesn't contain a JavaScript engine for them.</li>
 <li>No telemetry, no update checks.</li>
 <li>No list of recent files, unless you switch it on in Settings.</li>
-<li>Saved files get no author, dates or program name; when a PDF is saved, its author, creator and producer fields and its XMP metadata are removed (the title stays). Deleted pages are really removed from the file.</li></ul>
+<li>Saved files get no author, dates or program name; when a PDF is saved, its author, creator and producer fields, its XMP metadata and the names on its notes are removed (the title stays). Pictures are saved without their EXIF (camera, place, time). Deleted pages are really removed from the file.</li></ul>
 <p style="color:var(--muted)">Free software (MIT). PDF.js (Apache 2.0) and pdf-lib (MIT) are included.</p>` });
 }
 
@@ -346,8 +346,8 @@ body.addEventListener('drop', async (e) => {
   $('#welcome').classList.remove('drop');
   if (![...e.dataTransfer.types].includes('Files')) return;
   e.preventDefault();
-  const uri = (e.dataTransfer.getData('text/uri-list') || '').split(/\r?\n/).find((l) => l && !l.startsWith('#'));
-  if (uri && uri.startsWith('file://')) { post('drop', { uri }); return; }
+  // The file's contents go to leaflet.py, never a path: the page doesn't
+  // get to say which file on disk is opened.
   const file = e.dataTransfer.files[0];
   if (file) post('drop', { token: await put(await file.arrayBuffer()), name: file.name });
 });
@@ -359,19 +359,19 @@ function applyState(s) {
   document.documentElement.dataset.theme = state.theme || 'light';
   const list = $('#recent ul');
   list.innerHTML = '';
-  for (const path of state.recent || []) {
+  // leaflet.py keeps the paths; a file is asked for by its place in the list.
+  (state.recent || []).forEach((file, n) => {
     const li = document.createElement('li');
     const b = document.createElement('button');
-    const name = path.split('/').pop();
-    b.textContent = name;
+    b.textContent = file.name;
     const small = document.createElement('small');
-    small.textContent = path.slice(0, path.length - name.length - 1);
+    small.textContent = file.folder;
     b.append(small);
-    b.title = path;
-    b.addEventListener('click', () => post('open', { path }));
+    b.title = `${file.folder}/${file.name}`;
+    b.addEventListener('click', () => post('open', { recent: n }));
     li.append(b);
     list.append(li);
-  }
+  });
   $('#recent').hidden = !(state.recent || []).length;
 }
 
@@ -429,7 +429,7 @@ const handlers = {
   async exported(m) {     // a printed document: strip the metadata, then write it
     const ops = await pdfops();
     const clean = await ops.finalize(await take(m.token));
-    post('write-export', { token: await put(clean, 'application/pdf'), path: m.path });
+    post('write-export', { token: await put(clean, 'application/pdf'), ticket: m.ticket });
   },
   picked: (m) => mode?.picked(m),
   'save-request': () => save(false),
