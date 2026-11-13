@@ -290,6 +290,28 @@ def members(data):
         return {name: z.read(name) for name in z.namelist()}
 
 
+class UnpackedTotalTest(unittest.TestCase):
+    """What is really unpacked counts, not what the zip's headers claim."""
+
+    def test_running_total(self):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z:
+            for n in 'ab':
+                z.writestr(n, b'x' * 40)
+        saved = lf.MAX_MEMBER, lf.MAX_TOTAL
+        lf.MAX_MEMBER, lf.MAX_TOTAL = 60, 100
+        try:
+            # The headers' 80 bytes pass; reading 'a' a second time makes
+            # 120 really unpacked, which doesn't.
+            z = lf.open_zip(buf.getvalue())
+            lf.read_member(z, 'a')
+            lf.read_member(z, 'b')
+            with self.assertRaises(lf.FormatError):
+                lf.read_member(z, 'a')
+        finally:
+            lf.MAX_MEMBER, lf.MAX_TOTAL = saved
+
+
 class PictureMetadataTest(unittest.TestCase):
     """Pictures go into saved documents without EXIF (GPS, camera), XMP, IPTC, comments, text or dates."""
 

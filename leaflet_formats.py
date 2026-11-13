@@ -160,6 +160,9 @@ def open_zip(data: bytes):
         total += info.file_size
     if total > MAX_TOTAL:
         raise FormatError('the document unpacks to more than 256 MB')
+    # The sizes above are what the zip says; read_member counts what is
+    # really unpacked, since a forged header can say anything.
+    z.leaflet_unpacked = 0
     return z
 
 
@@ -170,10 +173,15 @@ def read_member(z, name, required=True):
         if required:
             raise FormatError(f'{name} is missing') from None
         return None
+    so_far = getattr(z, 'leaflet_unpacked', 0)
+    room = min(MAX_MEMBER, MAX_TOTAL - so_far)
     with z.open(info) as f:
-        data = f.read(MAX_MEMBER + 1)   # the size in the header could lie
+        data = f.read(room + 1)   # the size in the header could lie
+    z.leaflet_unpacked = so_far + len(data)
     if len(data) > MAX_MEMBER:
         raise FormatError(f'{name} is too large')
+    if len(data) > room:
+        raise FormatError('the document unpacks to more than 256 MB')
     return data
 
 

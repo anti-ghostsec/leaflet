@@ -464,10 +464,31 @@ class LeafletWindow(Gtk.ApplicationWindow):
             path = f.get_path() if f else None
             if not path:
                 return
-            if not path.lower().endswith('.' + fmt):
-                path += '.' + fmt
-            then(path)
+            if path.lower().endswith('.' + fmt):
+                then(path)
+                return
+            # The name chosen had no extension: the dialog asked about
+            # replacing that name, not this one, so ask here.
+            path += '.' + fmt
+            if os.path.lexists(path):
+                self.confirm_replace(path, then)
+            else:
+                then(path)
         dialog.save(self, None, done)
+
+    def confirm_replace(self, path, then):
+        name = os.path.basename(path)
+        dialog = Gtk.AlertDialog(message=f'{name} already exists. Replace it?',
+                                 detail=f'It\'s in {os.path.dirname(path)}. Replacing it overwrites what\'s there.',
+                                 buttons=['Cancel', 'Replace'], cancel_button=0, default_button=0, modal=True)
+
+        def done(d, res):
+            try:
+                if d.choose_finish(res) == 1:
+                    then(path)
+            except GLib.Error:
+                pass
+        dialog.choose(self, None, done)
 
     def write(self, path, data, fmt, msg):
         try:
